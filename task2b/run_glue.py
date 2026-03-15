@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -81,6 +82,11 @@ def sync_gradients_gather_scatter(args, model):
         param.grad.data /= dist.get_world_size()
 
 
+def append_metric_line(path, text):
+    with open(path, "a") as writer:
+        writer.write(text + "\n")
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
@@ -121,6 +127,10 @@ def train(args, train_dataset, model, tokenizer):
 
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
+    rank = dist.get_rank() if is_distributed(args) else 0
+    loss_log_file = os.path.join(args.output_dir, "loss_rank{}.txt".format(rank))
+    time_log_file = os.path.join(args.output_dir, "timing_rank{}.txt".format(rank))
+    iteration_times = []
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
@@ -129,6 +139,7 @@ def train(args, train_dataset, model, tokenizer):
             train_sampler.set_epoch(epoch_idx)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            iter_start_time = time.perf_counter()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -173,6 +184,11 @@ def train(args, train_dataset, model, tokenizer):
             if step < 5:
                 print("minibatch {} loss: {}".format(step + 1, loss.item()))
             ##################################################
+            append_metric_line(loss_log_file, "{},{}".format(global_step, loss.item()))
+            iter_time = time.perf_counter() - iter_start_time
+            append_metric_line(time_log_file, "{},{}".format(global_step, iter_time))
+            if global_step > 1:
+                iteration_times.append(iter_time)
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -186,6 +202,11 @@ def train(args, train_dataset, model, tokenizer):
         if args.local_rank in [-1, 0]:
             evaluate(args, model, tokenizer, prefix="")
         ##################################################
+
+    if iteration_times:
+        avg_iteration_time = sum(iteration_times) / len(iteration_times)
+        logger.info("Rank %d average iteration time excluding first iteration = %.6f seconds", rank, avg_iteration_time)
+        append_metric_line(time_log_file, "average_excluding_first,{}".format(avg_iteration_time))
 
     return global_step, tr_loss / global_step
 
